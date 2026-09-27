@@ -1,6 +1,16 @@
 export type ConnectionState = 'connected' | 'degraded' | 'offline';
 export type SegmentState = 'pending' | 'confirmed' | 'duplicate' | 'stale' | 'ignored';
 export type SegmentSource = 'live' | 'offline' | 'manual';
+export type RevisionKind = 'rework' | 'revert';
+
+export interface SegmentRevision {
+  id: string;
+  kind: RevisionKind;
+  reason: string;
+  beforeText: string;
+  afterText: string;
+  createdAt: number;
+}
 
 export interface CaptionSegment {
   id: string;
@@ -18,6 +28,7 @@ export interface CaptionSegment {
   staleReason?: string;
   revision: number;
   tags: string[];
+  revisions: SegmentRevision[];
 }
 
 export interface TermRule {
@@ -56,6 +67,9 @@ export interface ToastMessage {
 const now = Date.now();
 export const STORAGE_KEY = 'sologsb-1011-live-caption-desk-v1';
 
+/** 已播字幕确认后允许返修的时限：15 分钟。 */
+export const REWORK_WINDOW_MS = 15 * 60_000;
+
 function segment(
   id: string,
   sequence: number,
@@ -79,11 +93,25 @@ function segment(
     state,
     revision: 0,
     tags: [],
+    revisions: [],
   };
 }
 
 const seededSegments: CaptionSegment[] = [
-  segment('seg-1', 1, 0, '主持人', '欢迎大家来到二零二六年产品发布会。', '欢迎大家来到2026年产品发布会。', 'confirmed'),
+  {
+    ...segment('seg-1', 1, 0, '主持人', '欢迎大家来到二零二六年产品发布会。', '欢迎大家来到2026年产品发布会。', 'confirmed'),
+    tags: ['已返修'],
+    revisions: [
+      {
+        id: 'rev-seed-1',
+        kind: 'rework',
+        reason: '数字写法不统一，按规范使用阿拉伯数字',
+        beforeText: '欢迎大家来到二零二六年产品发布会。',
+        afterText: '欢迎大家来到2026年产品发布会。',
+        createdAt: now - 4 * 60_000,
+      },
+    ],
+  },
   segment('seg-2', 2, 7, '主讲人', '今天我们会介绍三个模块,首先是实时协作。', '今天我们会介绍三个模块，首先是实时协作。', 'confirmed'),
   segment('seg-3', 3, 15, '主讲人', '延迟和质量监测会帮助我们保持字幕稳定。', '延迟和质量监测会帮助我们保持字幕稳定。', 'confirmed'),
   segment('seg-4', 4, 24, '嘉宾 / 周然', '我们使用 studio cloud 作为演示环境。', '我们使用 Studio Cloud 作为演示环境。', 'pending'),
@@ -260,6 +288,7 @@ export function createLiveSegment(sequence: number): CaptionSegment {
     state: 'pending',
     revision: 0,
     tags: [],
+    revisions: [],
   };
 }
 
@@ -303,4 +332,114 @@ export function toSrt(model: DeskModel): string {
     .sort((a, b) => a.startTime - b.startTime)
     .map((item, index) => `${index + 1}\n${stamp(item.startTime)} --> ${stamp(item.startTime + 7)}\n[${item.speaker}] ${item.corrected}\n`)
     .join('\n');
+}
+
+/** 兼容旧版本草稿：补齐返修留痕字段。 */
+export function ensureRevisions(segments: CaptionSegment[]): CaptionSegment[] {
+  return segments.map((item) => (Array.isArray(item.revisions) ? item : { ...item, revisions: [] }));
+}
+
+function pendingOfflineCount(model: DeskModel): number {
+  return model.segments.filter((item) => item.source === 'offline' && item.state === 'confirmed').length;
+}
+
+export function formatDuration(ms: number): string {
+  if (ms <= 0) return '0 秒';
+  const totalSeconds = Math.ceil(ms / 1000);
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+  if (!minutes) return `${seconds} 秒`;
+  return seconds ? `${minutes} 分 ${seconds} 秒` : `${minutes} 分钟`;
+}
+
+export interface ReworkGuardResult {
+  allowed: boolean;
+  reason: string;
+}
+
+/**
+ * 已播字幕返修准入检查：
+ * - 只有已确认进入直播区的片段可返修；
+ * - 离线发件箱存在未合并内容时一律挡住，避免改到未定稿版本；
+ * - 只允许确认后 15 分钟内返修。
+ */
+export function reworkGuard(segmentItem: CaptionSegment | undefined, model: DeskModel): ReworkGuardResult {
+  if (!segmentItem) return { allowed: false, reason: '请先在直播区选择一条已确认字幕。' };
+  if (segmentItem.state !== 'confirmed') return { allowed: false, reason: '只有已确认进入直播区的字幕才能返修。' };
+  const offline = pendingOfflineCount(model);
+  if (offline > 0) {
+    return { allowed: false, reason: `离线发件箱还有 ${offline} 段未合并，请先恢复连接并合并后再返修。` };
+  }
+  const confirmedAt = segmentItem.confirmedAt ?? 0;
+  const elapsed = Date.now() - confirmedAt;
+  if (elapsed > REWORK_WINDOW_MS) {
+    return {
+      allowed: false,
+      reason: `该片段已确认 ${formatDuration(elapsed)}，超过 15 分钟返修时限（窗口在确认后 ${formatDuration(REWORK_WINDOW_MS)} 关闭）。`,
+    };
+  }
+  return { allowed: true, reason: '' };
+}
+
+export function reworkRemainingMs(segmentItem: CaptionSegment): number {
+  if (!segmentItem.confirmedAt) return 0;
+  return Math.max(0, REWORK_WINDOW_MS - (Date.now() - segmentItem.confirmedAt));
+}
+
+/** 有效版本链：按时间排列的全部返修/撤回记录。 */
+export function reworkChain(segmentItem: CaptionSegment): SegmentRevision[] {
+  return [...segmentItem.revisions].sort((a, b) => a.createdAt - b.createdAt);
+}
+
+/** 最近一次记录是返修时，才允许“回到上一版”；撤回后需重新返修，不能连续回退。 */
+export function canRevertRework(segmentItem: CaptionSegment): boolean {
+  return reworkChain(segmentItem).at(-1)?.kind === 'rework';
+}
+
+function syncReworkedTag(segmentItem: CaptionSegment, latestText: string): CaptionSegment {
+  const baseline = segmentItem.revisions[0]?.beforeText ?? segmentItem.original;
+  const reworked = latestText !== baseline;
+  const tags = reworked && !segmentItem.tags.includes('已返修')
+    ? [...segmentItem.tags, '已返修']
+    : !reworked ? segmentItem.tags.filter((tag) => tag !== '已返修') : segmentItem.tags;
+  return { ...segmentItem, tags };
+}
+
+/** 生成一次返修后的新片段，直播区与 SRT 随后都读取该新版本。 */
+export function buildReworkedSegment(segmentItem: CaptionSegment, nextText: string, reason: string): CaptionSegment {
+  const entry: SegmentRevision = {
+    id: `rev-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`,
+    kind: 'rework',
+    reason,
+    beforeText: segmentItem.corrected,
+    afterText: nextText,
+    createdAt: Date.now(),
+  };
+  return syncReworkedTag({
+    ...segmentItem,
+    corrected: nextText,
+    revision: segmentItem.revision + 1,
+    revisions: [...segmentItem.revisions, entry],
+  }, nextText);
+}
+
+/** 只回到上一版：撤回记录同样留痕，之后需重新返修才能再次操作。 */
+export function buildRevertedSegment(segmentItem: CaptionSegment): CaptionSegment | undefined {
+  const last = reworkChain(segmentItem).at(-1);
+  if (!last || last.kind !== 'rework') return undefined;
+  const nextText = last.beforeText;
+  const entry: SegmentRevision = {
+    id: `rev-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`,
+    kind: 'revert',
+    reason: '值班员撤回，回到上一版',
+    beforeText: segmentItem.corrected,
+    afterText: nextText,
+    createdAt: Date.now(),
+  };
+  return syncReworkedTag({
+    ...segmentItem,
+    corrected: nextText,
+    revision: segmentItem.revision + 1,
+    revisions: [...segmentItem.revisions, entry],
+  }, nextText);
 }

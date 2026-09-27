@@ -2,11 +2,20 @@ import { LitElement, css, html, nothing } from 'lit';
 import { customElement, state } from 'lit/decorators.js';
 import {
   applyRules,
+  buildReworkedSegment,
+  buildRevertedSegment,
+  canRevertRework,
   cloneModel,
   createInitialModel,
+  ensureRevisions,
+  formatDuration,
   mergeConfirmedSegments,
   normalizeNumbers,
   queueStats,
+  reworkChain,
+  reworkGuard,
+  reworkRemainingMs,
+  REWORK_WINDOW_MS,
   STORAGE_KEY,
   simulateLatency,
   toSrt,
@@ -212,11 +221,42 @@ export class CaptionDesk extends LitElement {
     .rule-form cds-text-input, .rule-form cds-button { width: 100%; }
     .rule-form .full { grid-column: 1 / -1; }
     .live-timeline { padding: 6px 0; }
-    .live-item { padding: 8px 11px; border-left: 3px solid #42be65; margin: 0 10px 7px; background: var(--cds-layer-02, #f4f4f4); }
+    button.live-item {
+      width: calc(100% - 20px); border: 1px solid transparent; border-left: 3px solid #42be65;
+      margin: 0 10px 7px; padding: 8px 11px; background: var(--cds-layer-02, #f4f4f4);
+      color: inherit; text-align: left; cursor: pointer; font: inherit;
+    }
+    button.live-item:hover { border-color: #78a9ff; }
+    button.live-item.selected { border-color: #0f62fe; outline: 1px solid #78a9ff; }
+    button.live-item.reworked { border-left-color: #0f62fe; }
     .live-item time { color: #198038; font: 500 9px/1 "IBM Plex Mono", monospace; }
     .live-item p { margin: 5px 0 0; font-size: var(--caption-font-size); line-height: 1.45; }
     .live-item small { display: block; margin-top: 4px; color: var(--cds-text-secondary, #525252); font-size: 9px; }
+    .live-item-foot { display: flex; flex-direction: column; gap: 2px; margin-top: 4px; }
+    .rework-flag { color: #0043ce !important; }
+    .rework-open { color: #0f62fe !important; }
+    .rework-closed { color: #8d8d8d !important; text-decoration: underline dotted; cursor: help; }
     .delivery-status { margin: 0 10px 10px; padding: 9px 10px; background: #edf5ff; border-left: 3px solid #0f62fe; color: #0043ce; font-size: 10px; line-height: 1.45; }
+
+    .rework-scroll { display: block; }
+    .rework-current { padding: 10px 12px; background: var(--cds-layer-02, #f4f4f4); border-left: 3px solid #42be65; }
+    .rework-current span { color: #198038; font-size: 10px; font-weight: 600; }
+    .rework-current p { margin: 5px 0 0; font-size: var(--caption-font-size); line-height: 1.5; }
+    .rework-presets { display: flex; align-items: center; gap: 4px; flex-wrap: wrap; }
+    .rework-presets > span { margin-right: 4px; color: var(--cds-text-secondary, #525252); font-size: 10px; }
+    .rework-history { border-top: 1px solid var(--cds-border-subtle, #e0e0e0); padding-top: 10px; }
+    .rework-history h4 { margin: 0 0 8px; font-size: 11px; }
+    .rework-history ul { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 7px; }
+    .revision-item { padding: 8px 10px; background: var(--cds-layer-02, #f4f4f4); border-left: 3px solid #0f62fe; }
+    .revision-item.revert { border-left-color: #8d8d8d; }
+    .revision-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+    .revision-head time { color: var(--cds-text-secondary, #525252); font: 500 9px/1 "IBM Plex Mono", monospace; }
+    .revision-item p { margin: 5px 0 0; font-size: 10px; line-height: 1.5; }
+    .revision-before { color: #8d8d8d; text-decoration: line-through; text-decoration-color: rgba(141, 141, 141, .55); }
+    .revision-after { color: #0043ce; font-weight: 500; }
+    .revision-reason { color: var(--cds-text-secondary, #525252); }
+    .revision-empty { margin: 0; color: var(--cds-text-secondary, #525252); font-size: 10px; }
+    .rework-bar { flex-wrap: wrap; gap: 8px; }
 
     .toast-stack { position: fixed; right: 18px; bottom: 18px; z-index: 20; width: 380px; display: flex; flex-direction: column; gap: 8px; }
     cds-toast-notification { box-shadow: 0 8px 22px rgba(0,0,0,.18); }
@@ -246,6 +286,9 @@ export class CaptionDesk extends LitElement {
   @state() private ruleSpeaker = '';
   @state() private filter: 'active' | 'all' | 'attention' = 'active';
   @state() private showRuleForm = false;
+  @state() private reworkText = this.model.segments.find((item) => item.id === this.model.selectedId && item.state === 'confirmed')?.corrected ?? '';
+  @state() private reworkReason = '';
+  @state() private clockTick = 0;
   private past: DeskModel[] = [];
   private future: DeskModel[] = [];
   private ticker?: number;
@@ -256,9 +299,12 @@ export class CaptionDesk extends LitElement {
     this.ticker = window.setInterval(() => {
       const next = simulateLatency(this.model);
       const changed = JSON.stringify(next.segments) !== JSON.stringify(this.model.segments) || next.connection !== this.model.connection;
-      if (!changed) return;
-      this.model = next;
-      this.persist();
+      if (changed) {
+        this.model = next;
+        this.persist();
+      }
+      // 返修倒计时按真实时间走动，即使队列没有变化也要刷新。
+      this.clockTick += 1;
     }, 5_000);
   }
 
@@ -273,7 +319,9 @@ export class CaptionDesk extends LitElement {
       const raw = localStorage.getItem(STORAGE_KEY);
       if (raw) {
         const parsed = JSON.parse(raw) as DeskModel;
-        if (parsed.segments?.length) return parsed;
+        if (parsed.segments?.length) {
+          return { ...parsed, segments: ensureRevisions(parsed.segments) };
+        }
       }
     } catch {
       // 损坏草稿会回退到演示数据。
@@ -301,12 +349,18 @@ export class CaptionDesk extends LitElement {
     this.persist();
   }
 
+  private syncReworkDraft(): void {
+    const selected = this.selected;
+    if (selected?.state === 'confirmed') this.reworkText = selected.corrected;
+  }
+
   private undo(): void {
     const previous = this.past.pop();
     if (!previous) return this.pushToast('info', '没有可撤销的修改', '历史记录为空');
     this.future = [cloneModel(this.model), ...this.future].slice(0, HISTORY_LIMIT);
     this.model = previous;
     this.persist();
+    this.syncReworkDraft();
   }
 
   private redo(): void {
@@ -315,6 +369,7 @@ export class CaptionDesk extends LitElement {
     this.past = [...this.past, cloneModel(this.model)].slice(-HISTORY_LIMIT);
     this.model = next;
     this.persist();
+    this.syncReworkDraft();
   }
 
   private pushToast(kind: ToastMessage['kind'], title: string, subtitle: string): void {
@@ -351,9 +406,18 @@ export class CaptionDesk extends LitElement {
     }));
   }
 
-  private selectSegment(id: string): void {
+  private selectSegment(id: string, silent = false): void {
     this.model = { ...this.model, selectedId: id };
     this.persist();
+    const item = this.selected;
+    if (item?.state === 'confirmed') {
+      this.reworkText = item.corrected;
+      this.reworkReason = '';
+      if (!silent) {
+        const guard = reworkGuard(item, this.model);
+        if (!guard.allowed) this.pushToast('warning', '暂不能返修该片段', guard.reason);
+      }
+    }
   }
 
   private navigate(direction: number): void {
@@ -436,6 +500,11 @@ export class CaptionDesk extends LitElement {
       this.pushToast('warning', '没有可确认的片段', '请先从待确认区选择字幕');
       return;
     }
+    if (selected.state === 'confirmed') {
+      const guard = reworkGuard(selected, this.model);
+      this.pushToast(guard.allowed ? 'info' : 'warning', guard.allowed ? '该片段已在直播区' : '返修被挡住', guard.allowed ? '需要改正请使用编辑台的「直播返修」卡片' : guard.reason);
+      return;
+    }
     const { text, used } = applyRules(selected.corrected, this.model);
     const offline = this.model.connection === 'offline';
     const nextOrder = this.pendingSegments.filter((item) => item.id !== selected.id);
@@ -475,6 +544,57 @@ export class CaptionDesk extends LitElement {
       ...current,
       segments: current.segments.map((item) => item.id === selected.id ? { ...item, state: 'pending', duplicateOf: undefined, staleReason: '重复提示已由校对员确认保留' } : item),
     }));
+  }
+
+  private reworkCheck(): { allowed: boolean; reason: string; item?: CaptionSegment } {
+    const item = this.selected;
+    const guard = reworkGuard(item, this.model);
+    if (item && !guard.allowed) this.pushToast('error', '返修被挡住', guard.reason);
+    return { ...guard, item };
+  }
+
+  private submitRework(): void {
+    const check = this.reworkCheck();
+    if (!check.allowed || !check.item) return;
+    const nextText = this.reworkText.trim();
+    const reason = this.reworkReason.trim();
+    if (!nextText) {
+      this.pushToast('warning', '返修正文为空', '请填写修改后的字幕正文');
+      return;
+    }
+    if (!reason) {
+      this.pushToast('warning', '请填写返修原因', '例如：专有名词写错、点名错误，留痕时需要说明');
+      return;
+    }
+    if (nextText === check.item.corrected) {
+      this.pushToast('info', '正文没有变化', '返修仅在内容改动后生效');
+      return;
+    }
+    const target = check.item;
+    this.commit(`已返修第 ${target.sequence} 段`, (current) => ({
+      ...current,
+      segments: current.segments.map((item) => item.id === target.id ? buildReworkedSegment(item, nextText, reason) : item),
+    }));
+    this.pushToast('success', '直播区已更新为新版本', `第 ${target.sequence} 段返修完成，导出 SRT 同样使用新版本`);
+    this.reworkText = nextText;
+    this.reworkReason = '';
+  }
+
+  private revertRework(): void {
+    const check = this.reworkCheck();
+    if (!check.allowed || !check.item) return;
+    if (!canRevertRework(check.item)) {
+      this.pushToast('info', '没有可撤回的返修', '只能在最近一次返修后回到上一版');
+      return;
+    }
+    const target = check.item;
+    this.commit(`撤回第 ${target.sequence} 段返修`, (current) => ({
+      ...current,
+      segments: current.segments.map((item) => item.id === target.id ? buildRevertedSegment(item) ?? item : item),
+    }));
+    this.pushToast('success', '已回到上一版', `第 ${target.sequence} 段正文已恢复，撤回记录仍保留在返修留痕中`);
+    this.syncReworkDraft();
+    this.reworkReason = '';
   }
 
   private setConnection(connection: ConnectionState): void {
@@ -623,11 +743,106 @@ export class CaptionDesk extends LitElement {
     `;
   }
 
+  private renderReworkEditor(item: CaptionSegment) {
+    const guard = reworkGuard(item, this.model);
+    const chain = reworkChain(item);
+    const remaining = reworkRemainingMs(item);
+    const revertable = guard.allowed && canRevertRework(item);
+    const reworkCount = chain.filter((entry) => entry.kind === 'rework').length;
+    const reasonPresets = ['专有名词写错', '发言人点名错误', '数字或标点错误', '语句与直播口播不一致'];
+    return html`
+      <div class="editor-scroll rework-scroll">
+        <div class="editor-card rework-card">
+          <div class="editor-top">
+            <div>
+              <div class="editor-time">${formatClock(item.startTime)} — ${formatClock(item.startTime + 7)}</div>
+              <p class="editor-title">已播片段 #${String(item.sequence).padStart(3, '0')} · ${item.speaker} · 确认于 ${formatAge(item.confirmedAt ?? item.receivedAt)}</p>
+            </div>
+            <div class="editor-status">
+              <cds-tag type="green" size="sm">直播中</cds-tag>
+              <cds-tag type="outline" size="sm">返修 ${reworkCount} 次</cds-tag>
+            </div>
+          </div>
+          <div class="editor-form">
+            ${guard.allowed ? html`
+              <cds-inline-notification kind="info" low-contrast title="返修窗口开放"
+                subtitle=${`确认后 ${formatDuration(REWORK_WINDOW_MS)} 内可返修，剩余 ${formatDuration(remaining)}。新版本会立即替换直播区，并用于之后导出的 SRT。`}>
+              </cds-inline-notification>
+            ` : html`
+              <cds-inline-notification kind="error" low-contrast title="当前不能返修" subtitle=${guard.reason}></cds-inline-notification>
+            `}
+            <div class="rework-current">
+              <span>直播区当前版本</span>
+              <p>${item.corrected}</p>
+            </div>
+            <cds-textarea
+              class="caption-input"
+              label-text="返修后的字幕正文"
+              helper-text="修改专有名词、点名或语句；提交后直播区和 SRT 都改用此版本"
+              .value=${this.reworkText}
+              ?disabled=${!guard.allowed}
+              @input=${(event: Event) => { this.reworkText = (event.currentTarget as any).value; }}
+            ></cds-textarea>
+            <cds-text-input
+              label-text="返修原因（必填）"
+              placeholder="例如：专有名词写错，应为 Studio Cloud"
+              .value=${this.reworkReason}
+              ?disabled=${!guard.allowed}
+              @input=${(event: Event) => { this.reworkReason = (event.currentTarget as any).value; }}
+            ></cds-text-input>
+            <div class="rework-presets">
+              <span>常用原因</span>
+              ${reasonPresets.map((preset) => html`
+                <cds-button kind="ghost" size="sm" ?disabled=${!guard.allowed} @click=${() => { this.reworkReason = preset; }}>${preset}</cds-button>
+              `)}
+            </div>
+            <div class="rework-history">
+              <h4>返修留痕 · ${chain.length} 条版本记录</h4>
+              ${chain.length ? html`
+                <ul>
+                  ${(() => {
+                    let ordinal = 0;
+                    const ordinals = new Map<string, number>();
+                    for (const entry of chain) {
+                      if (entry.kind === 'rework') {
+                        ordinal += 1;
+                        ordinals.set(entry.id, ordinal);
+                      }
+                    }
+                    return chain.slice().reverse().map((entry) => html`
+                      <li class="revision-item ${entry.kind}">
+                        <div class="revision-head">
+                          <cds-tag type=${entry.kind === 'rework' ? 'blue' : 'warm-gray'} size="sm">${entry.kind === 'rework' ? `第 ${ordinals.get(entry.id)} 版返修` : '回到上一版'}</cds-tag>
+                          <time>${new Date(entry.createdAt).toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' })}</time>
+                        </div>
+                        <p class="revision-before">修改前：${entry.beforeText}</p>
+                        <p class="revision-after">修改后：${entry.afterText}</p>
+                        <p class="revision-reason">原因：${entry.reason}</p>
+                      </li>
+                    `);
+                  })()}
+                </ul>
+              ` : html`<p class="revision-empty">该片段尚未返修；确认时的正文就是当前直播版本。</p>`}
+            </div>
+          </div>
+          <div class="confirm-bar rework-bar">
+            <div class="confirm-hint"><kbd>⌘/Ctrl Z</kbd> 可撤销操作 · 撤回只回到上一版，每次修改前后内容都会保留</div>
+            <div>
+              <cds-button kind="secondary" size="sm" ?disabled=${!revertable} @click=${this.revertRework}>回到上一版</cds-button>
+              <cds-button kind="primary" ?disabled=${!guard.allowed} @click=${this.submitRework}>提交返修并更新直播</cds-button>
+            </div>
+          </div>
+        </div>
+      </div>
+    `;
+  }
+
   private renderEditor() {
     const item = this.selected;
     if (!item) {
       return html`<div class="empty"><strong>选择一条待确认字幕</strong><p>可以使用 Alt+J / Alt+K 在片段之间移动。</p></div>`;
     }
+    if (item.state === 'confirmed') return this.renderReworkEditor(item);
     const applicableRules = this.model.rules.filter((rule) => rule.enabled && (!rule.speaker || rule.speaker === item.speaker));
     return html`
       <div class="editor-scroll">
@@ -732,16 +947,26 @@ export class CaptionDesk extends LitElement {
         <section class="inspector-section">
           <div class="inspector-section-head">
             <h3>直播区时间线</h3>
-            <span>${confirmed.length} 段已确认</span>
+            <span>${confirmed.length} 段已确认 · ${confirmed.reduce((total, segmentItem) => total + segmentItem.revisions.filter((entry) => entry.kind === 'rework').length, 0)} 次返修</span>
           </div>
           <div class="live-timeline">
-            ${confirmed.length ? confirmed.slice(-12).reverse().map((segment) => html`
-              <article class="live-item">
-                <time>${formatClock(segment.startTime)} · ${segment.speaker}</time>
-                <p>${segment.corrected}</p>
-                ${segment.source === 'offline' ? html`<small>离线来源 · 恢复后合并</small>` : nothing}
-              </article>
-            `) : html`<div class="empty"><strong>直播区等待内容</strong><p>确认一块字幕后，它会从这里进入实时输出。</p></div>`}
+            ${confirmed.length ? confirmed.slice(-12).reverse().map((segmentItem) => {
+              const liveGuard = reworkGuard(segmentItem, this.model);
+              const reworks = segmentItem.revisions.filter((entry) => entry.kind === 'rework').length;
+              const latest = reworkChain(segmentItem).at(-1);
+              return html`
+              <button class="live-item ${segmentItem.id === this.model.selectedId ? 'selected' : ''} ${reworks ? 'reworked' : ''}" @click=${() => this.selectSegment(segmentItem.id, true)}>
+                <time>${formatClock(segmentItem.startTime)} · ${segmentItem.speaker}</time>
+                <p>${segmentItem.corrected}</p>
+                <div class="live-item-foot">
+                  ${segmentItem.source === 'offline' ? html`<small>离线来源 · 恢复后合并</small>` : html`<small>${formatAge(segmentItem.confirmedAt ?? segmentItem.receivedAt)}确认</small>`}
+                  ${reworks ? html`<small class="rework-flag">已返修 ${reworks} 次${latest ? ` · ${latest.kind === 'revert' ? '当前为撤回版本' : latest.reason}` : ''}</small>` : nothing}
+                  ${liveGuard.allowed
+                    ? html`<small class="rework-open">返修窗口剩 ${formatDuration(reworkRemainingMs(segmentItem))} · 点击修改</small>`
+                    : html`<small class="rework-closed" title=${liveGuard.reason}>不可返修</small>`}
+                </div>
+              </button>
+            `;}) : html`<div class="empty"><strong>直播区等待内容</strong><p>确认一块字幕后，它会从这里进入实时输出。</p></div>`}
           </div>
           ${this.stats.offline > 0 ? html`<div class="delivery-status">离线发件箱有 ${this.stats.offline} 段待合并。恢复连接后按时间顺序提交，不会覆盖已确认内容。</div>` : nothing}
         </section>
@@ -755,7 +980,10 @@ export class CaptionDesk extends LitElement {
             ${item ? html`
               <div><strong>原始字幕：</strong>${item.original}</div>
               <div style="margin-top: 8px;"><strong>修改前校正：</strong>${item.corrected}</div>
-              <div style="margin-top: 8px; color: var(--cds-text-secondary);">${item.tags.length ? `标签：${item.tags.join('、')}` : '尚未应用术语标签'}</div>
+              ${item.state === 'confirmed' ? html`
+                <div style="margin-top: 8px;"><strong>返修留痕：</strong>${item.revisions.length ? `${item.revisions.filter((entry) => entry.kind === 'rework').length} 次返修 / ${item.revisions.filter((entry) => entry.kind === 'revert').length} 次撤回，完整记录见编辑台` : '暂无返修记录'}</div>
+                <div style="margin-top: 8px; color: var(--cds-text-secondary);">确认时间 ${item.confirmedAt ? new Date(item.confirmedAt).toLocaleTimeString('zh-CN') : '—'}，返修窗口 ${reworkGuard(item, this.model).allowed ? `剩余 ${formatDuration(reworkRemainingMs(item))}` : '已关闭'}</div>
+              ` : html`<div style="margin-top: 8px; color: var(--cds-text-secondary);">${item.tags.length ? `标签：${item.tags.join('、')}` : '尚未应用术语标签'}</div>`}
             ` : html`<span>请选择片段以查看上下文。</span>`}
           </div>
         </section>
@@ -829,7 +1057,7 @@ export class CaptionDesk extends LitElement {
             <div class="column-head">
               <div>
                 <h2>校对编辑台</h2>
-                <p>标点、专有名词、发言人和数字均可在确认前修改</p>
+                <p>确认前可改标点、专有名词、发言人和数字；已播片段确认后 15 分钟内可返修</p>
               </div>
               <cds-tag type="green" size="sm">本地草稿</cds-tag>
             </div>
@@ -840,7 +1068,7 @@ export class CaptionDesk extends LitElement {
             <div class="column-head">
               <div>
                 <h2>规则与直播区</h2>
-                <p>确认后进入直播输出；离线内容恢复后统一合并</p>
+                <p>确认后进入直播输出；15 分钟内可在编辑台返修，离线内容恢复后统一合并</p>
               </div>
               ${this.model.connection === 'offline'
                 ? html`<cds-button kind="primary" size="sm" @click=${this.mergeOffline}>恢复并合并</cds-button>`
