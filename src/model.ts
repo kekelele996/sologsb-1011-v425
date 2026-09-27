@@ -31,11 +31,22 @@ export interface TermRule {
   createdAt: number;
 }
 
+export interface ReworkRecord {
+  id: string;
+  segmentId: string;
+  sequence: number;
+  reason: string;
+  before: string;
+  after: string;
+  reworkedAt: number;
+}
+
 export interface DeskModel {
   eventName: string;
   eventDate: string;
   segments: CaptionSegment[];
   rules: TermRule[];
+  reworks: ReworkRecord[];
   selectedId: string;
   connection: ConnectionState;
   simulatedDelay: number;
@@ -55,6 +66,7 @@ export interface ToastMessage {
 
 const now = Date.now();
 export const STORAGE_KEY = 'sologsb-1011-live-caption-desk-v1';
+export const REWORK_WINDOW_MS = 15 * 60_000;
 
 function segment(
   id: string,
@@ -109,6 +121,7 @@ export function createInitialModel(): DeskModel {
       { id: 'term-2', source: 'studio cloud', replacement: 'Studio Cloud', speaker: '', enabled: true, caseSensitive: false, usageCount: 7, createdAt: now - 43_200_000 },
       { id: 'term-3', source: '五G', replacement: '5G', speaker: '', enabled: true, caseSensitive: true, usageCount: 2, createdAt: now - 3_600_000 },
     ],
+    reworks: [],
     selectedId: 'seg-4',
     connection: 'connected',
     simulatedDelay: 1.8,
@@ -219,6 +232,22 @@ export function mergeConfirmedSegments(model: DeskModel): DeskModel {
     lastMergedAt: Date.now(),
     updatedAt: Date.now(),
   };
+}
+
+export function reworkBlockReason(segment: CaptionSegment, now = Date.now()): string | null {
+  if (segment.state !== 'confirmed') return '只有已进入直播区的已确认片段可以返修';
+  if (segment.source === 'offline') return '该片段离线确认后尚未合并，请先恢复连接并合并离线队列，再进行返修';
+  if (!segment.confirmedAt) return '该片段缺少确认时间，无法计算返修时限';
+  const elapsed = now - segment.confirmedAt;
+  if (elapsed > REWORK_WINDOW_MS) {
+    return `已超过确认后 15 分钟的返修时限（该片段确认于 ${Math.floor(elapsed / 60_000)} 分钟前）`;
+  }
+  return null;
+}
+
+export function reworkRemaining(segment: CaptionSegment, now = Date.now()): number {
+  if (!segment.confirmedAt) return 0;
+  return Math.max(0, REWORK_WINDOW_MS - (now - segment.confirmedAt));
 }
 
 export function queueStats(model: DeskModel) {
